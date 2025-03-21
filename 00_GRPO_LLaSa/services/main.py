@@ -11,7 +11,6 @@ import librosa
 import torch
 import jiwer
 import math
-import uvicorn
 from typing import List
 from fastapi import FastAPI, HTTPException
 from models import TranscriptionRequest, TranscriptionResponse, DecodingRequest, DecodingResponse, CombinedRequest, CombinedResponse
@@ -114,6 +113,7 @@ async def decode_speech_tokens(request: DecodingRequest):
         )
     except Exception as e:
         logger.error(f"Error during decoding: {e}")
+        logger.error(f"Speech tokens: {request.speech_tokens_str}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -201,5 +201,4 @@ async def health_check():
     }
 
 
-if __name__ == "__main__":
-    uvicorn.run("speech_service:app", host="0.0.0.0", port=8080)
+# run with fastapi run main.py --port 8080

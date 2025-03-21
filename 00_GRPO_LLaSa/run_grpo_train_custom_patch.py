@@ -12,7 +12,7 @@ import os
 import asyncio
 import aiohttp
 import re 
-
+from filter_text import filter_text
 
 load_dotenv("../.env")
 
@@ -43,7 +43,14 @@ processor = AutoTokenizer.from_pretrained(model_name)
 
 
 dataset = load_from_disk("/media/bodza/Audio_Dataset/COMPLETE_DATASET")
-dataset = dataset["train"].shuffle(seed=43).select(range(5_000)).map(
+dataset = dataset["train"].shuffle(43).select(range(50_000)).filter(filter_text, num_proc=4, batched=True)
+#     features: ['text', 'start', 'end', 'speaker', 'language', 
+# 'dnsmos', 'podcast_name', 'episode_name', 'utterance_pitch_mean', 
+# 'utterance_pitch_std', 'snr', 'c50', 'speaking_rate', 'phonemes', 
+# 'gender', 'stoi', 'si-sdr', 'pesq', 'speaker_id', 'pitch', 'noise', 
+# 'reverberation', 'speech_monotony', 'sdr_noise', 'pesq_speech_quality', 'prompt', 
+# 'text_description', 'answer']
+dataset = dataset.shuffle(seed=43).select(range(10_000)).map(
     lambda x: {
         "prompt": [
         {"role": "user", "content": "Convert the text to speech:" + "<|TEXT_UNDERSTANDING_START|>{}<|TEXT_UNDERSTANDING_END|>".format(x["text"])},
@@ -52,7 +59,7 @@ dataset = dataset["train"].shuffle(seed=43).select(range(5_000)).map(
         "answer": x["text"],
     }
 )
-
+print(dataset)
 
 async def process_audio_sample(speech_tokens_str: str, expected_answer: str) -> float:
     """
@@ -125,8 +132,8 @@ def wer_reward_func(prompts, completions, answer, **kwargs) -> list[float]:
 
 
 
-output_dir = "/media/bodza/Audio_Dataset/llasa_GRPO_higherAcc_cosine_higherlr"
-run_name = "SmolKartoffel-135M-v0.1_GRPO_higherAcc_cosine_higherlr"
+output_dir = "/media/bodza/Audio_Dataset/llasa_GRPO_higherAcc_cosine_higherlr_longer_cosine_longer"
+run_name = "SmolKartoffel-135M-v0.1_GRPO_higherAcc_cosine_higherlr_longer_cosine_longer"
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 
@@ -138,7 +145,8 @@ training_args = GRPOConfig(
     adam_beta2 = 0.99,
     weight_decay = 0.1,
     warmup_ratio = 0.05,
-    lr_scheduler_type='cosine',
+    # lr_scheduler_type='cosine',
+    lr_scheduler_type="constant_with_warmup",
     optim = "paged_adamw_8bit",
     logging_steps=1,
     bf16=True,
@@ -156,7 +164,7 @@ training_args = GRPOConfig(
     # vllm_device="cuda:0",
     # vllm_gpu_memory_utilization=0.08,
     vllm_device="cuda:1",
-    vllm_gpu_memory_utilization=0.2,
+    vllm_gpu_memory_utilization=0.3,
     vllm_max_model_len=2048,
     vllm_dtype="half",
     gradient_checkpointing=True,

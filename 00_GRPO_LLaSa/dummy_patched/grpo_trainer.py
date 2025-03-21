@@ -1,3 +1,5 @@
+# Checkout https://github.com/huggingface/trl/tree/fc4dae256d924dfbb906af9c2e817bc6fb7b590b/
+# and replace the grpo trainer
 # Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
