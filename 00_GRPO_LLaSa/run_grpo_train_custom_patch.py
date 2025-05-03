@@ -11,7 +11,6 @@ from trl import GRPOConfig, GRPOTrainer
 import os 
 import asyncio
 import aiohttp
-import re 
 from filter_text import filter_text
 
 load_dotenv("../.env")
@@ -78,7 +77,7 @@ async def process_audio_sample(speech_tokens_str: str, expected_answer: str) -> 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "http://localhost:8000/end_to_end", json=payload, timeout=300
+                "http://localhost:8080/end_to_end", json=payload, timeout=300
             ) as response:
                 if response.status == 200:
                     result = await response.json()
