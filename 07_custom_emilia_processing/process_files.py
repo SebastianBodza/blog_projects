@@ -9,20 +9,48 @@ import tempfile
 import time
 import gc
 import math
+import argparse
+import fcntl
 from collections import Counter
 from pathlib import Path
 from dotenv import load_dotenv
 import whisperx
 from whisperx.audio import N_SAMPLES, log_mel_spectrogram
 
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Process audio files with WhisperX")
+    parser.add_argument("--gpu", type=int, default=0, help="GPU ID to use (0, 1, etc.)")
+    parser.add_argument(
+        "--sample-size", type=int, default=10, help="Number of files to process"
+    )
+    parser.add_argument(
+        "--instance-id",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="Instance ID (0 or 1) to split workload",
+    )
+    return parser.parse_args()
+
+
+# Parse arguments
+args = parse_args()
+
+# Set GPU device
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+print(f"Using GPU: {args.gpu}")
+
 # Load environment variables
 load_dotenv()
 os.environ["HF_HOME"] = "/media/bodza/Audio_Dataset/hf_cache/"
-
 # Constants
 PROCESSING_DIR = "/media/bodza/Audio_Dataset/RAW_PROCESSED"
 OUTPUT_DIR = "/media/bodza/Audio_Dataset/MULTI_SPEAKER_PROCESSED/WHISPERX_NEW"
-SAMPLE_SIZE = 10  # Number of files to process in one run
+SAMPLE_SIZE = args.sample_size  # Number of files to process in one run
+INSTANCE_ID = args.instance_id  # Instance ID (0 or 1)
+LOCK_DIR = os.path.join(OUTPUT_DIR, "locks")
 
 # WhisperX parameters
 WHISPER_ARCH = "Systran/faster-whisper-large-v3"
@@ -49,6 +77,38 @@ DEBUG = True
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
+# Create lock directory if it doesn't exist
+if not os.path.exists(LOCK_DIR):
+    os.makedirs(LOCK_DIR)
+
+
+def get_lock_path(file_path):
+    """Get lock file path for a given audio file."""
+    file_hash = str(hash(file_path) % 10000).zfill(5)
+    return os.path.join(LOCK_DIR, f"lock_{file_hash}.lock")
+
+
+def acquire_lock(lock_path):
+    """Try to acquire lock for a file. Return True if successful, False otherwise."""
+    try:
+        lock_file = open(lock_path, "w")
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Write process ID to lock file
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+        return True, lock_file
+    except (IOError, BlockingIOError):
+        return False, None
+
+
+def release_lock(lock_file, lock_path):
+    """Release the lock."""
+    if lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+    if os.path.exists(lock_path):
+        os.unlink(lock_path)
+
 
 def search_unprocessed_files():
     """Find all audio files that haven't been processed yet."""
@@ -73,7 +133,11 @@ def search_unprocessed_files():
             os.path.join(output_subdir, "*.mp3")
         )
 
-        if not json_exists_and_not_empty and not output_mp3s_exist:
+        # Check if file is locked (being processed by another instance)
+        lock_path = get_lock_path(file_path)
+        file_locked = os.path.exists(lock_path)
+
+        if not json_exists_and_not_empty and not output_mp3s_exist and not file_locked:
             unprocessed_files.append(file_path)
 
     return unprocessed_files
@@ -81,8 +145,8 @@ def search_unprocessed_files():
 
 def get_weighted_sample(unprocessed_files, sample_size):
     """
-    Get a sample of files with equal representation from each folder.
-    This ensures each folder has an equal chance of being selected.
+    Get a sample of files with equal representation from each folder,
+    split based on instance ID.
     """
     if not unprocessed_files:
         return []
@@ -108,20 +172,31 @@ def get_weighted_sample(unprocessed_files, sample_size):
 
     # Select files from each folder
     selected_files = []
-    folder_names = list(folders.keys())
+    folder_names = sorted(list(folders.keys()))  # Sort to ensure consistent order
+
+    # Process alternating folders based on instance ID
+    # Instance 0 gets folders at even indices, Instance 1 gets folders at odd indices
+    instance_folders = folder_names[INSTANCE_ID::2]
 
     # First ensure each folder gets represented
-    for folder_name in folder_names:
+    for folder_name in instance_folders:
         folder_files = folders[folder_name]
         # Take min in case a folder has fewer files than files_per_folder
-        num_to_select = min(files_per_folder, len(folder_files))
+        num_to_select = min(
+            files_per_folder * 2, len(folder_files)
+        )  # Double the files since we're using half the folders
         if num_to_select > 0:
             selected_files.extend(random.sample(folder_files, num_to_select))
 
     # If we need more files to reach sample_size, randomly select from remaining files
+    # (from the instance's assigned folders only)
     if remaining > 0 and len(selected_files) < sample_size:
-        # Get all files not already selected
-        remaining_files = [f for f in unprocessed_files if f not in selected_files]
+        remaining_files = []
+        for folder_name in instance_folders:
+            remaining_files.extend(
+                [f for f in folders[folder_name] if f not in selected_files]
+            )
+
         if remaining_files:
             # Select additional files randomly
             additional = random.sample(
@@ -134,17 +209,17 @@ def get_weighted_sample(unprocessed_files, sample_size):
         selected_files = random.sample(selected_files, sample_size)
 
     # Print summary information
-    print(f"\nSelected {len(selected_files)} files with uniform folder distribution:")
+    print(
+        f"\nSelected {len(selected_files)} files with uniform folder distribution (Instance {INSTANCE_ID}):"
+    )
     folder_distribution = Counter(
         [os.path.basename(os.path.dirname(f)) for f in selected_files]
     )
     for folder, count in folder_distribution.most_common():
         print(f"  Folder: {folder} - Files: {count}")
-
     for f in selected_files:
         folder = os.path.basename(os.path.dirname(f))
         print(f"  - {folder}: {os.path.basename(f)}")
-
     return selected_files
 
 
@@ -445,140 +520,148 @@ def extract_and_save_segments(audio_file_path, segments, output_dir):
 
 def process_file(audio_file_path, language=None):
     """Process a single audio file with WhisperX."""
-    print(f"\nProcessing: {audio_file_path}")
+    # Acquire a lock for this file
+    lock_path = get_lock_path(audio_file_path)
+    lock_acquired, lock_file = acquire_lock(lock_path)
 
-    # Create output directory for this file
-    relative_path = os.path.relpath(os.path.dirname(audio_file_path), PROCESSING_DIR)
-    base_filename = os.path.basename(os.path.splitext(audio_file_path)[0])
-    output_subdir = os.path.join(OUTPUT_DIR, relative_path, base_filename)
-    os.makedirs(output_subdir, exist_ok=True)
-
-    # Save JSON path (in same folder as input file)
-    json_output_path = os.path.splitext(audio_file_path)[0] + ".json"
-
-    with torch.inference_mode():
-        asr_options = {
-            "initial_prompt": INITIAL_PROMPT,
-            "temperatures": TEMPERATURES,
-            "beam_size": BEAM_SIZE,
-            "best_of": BEST_OF,
-        }
-
-        vad_options = {"vad_onset": VAD_ONSET, "vad_offset": VAD_OFFSET}
-
-        # Perform language detection if needed
-        audio_duration = get_audio_duration(audio_file_path)
-
-        if (
-            language is None
-            and LANGUAGE_DETECTION_MIN_PROB > 0
-            and audio_duration > 30000
-        ):
-            segments_duration_ms = 30000
-
-            language_detection_max_tries = min(
-                LANGUAGE_DETECTION_MAX_TRIES,
-                math.floor(audio_duration / segments_duration_ms),
-            )
-
-            segments_starts = distribute_segments_equally(
-                audio_duration, segments_duration_ms, language_detection_max_tries
-            )
-
-            print(
-                "Detecting languages on segments starting at "
-                + ", ".join(map(str, segments_starts))
-            )
-
-            detected_language_details = detect_language(
-                audio_file_path,
-                segments_starts,
-                LANGUAGE_DETECTION_MIN_PROB,
-                LANGUAGE_DETECTION_MAX_TRIES,
-                asr_options,
-                vad_options,
-            )
-
-            detected_language_code = detected_language_details["language"]
-            detected_language_prob = detected_language_details["probability"]
-            detected_language_iterations = detected_language_details["iterations"]
-
-            print(
-                f"Detected language {detected_language_code} ({detected_language_prob:.2f}) after "
-                f"{detected_language_iterations} iterations."
-            )
-
-            language = detected_language_details["language"]
-
-        # Load model and transcribe
-        start_time = time.time_ns() / 1e6
-
-        model = whisperx.load_model(
-            WHISPER_ARCH,
-            DEVICE,
-            compute_type=COMPUTE_TYPE,
-            language=language,
-            asr_options=asr_options,
-            vad_options=vad_options,
+    if not lock_acquired:
+        print(
+            f"File {audio_file_path} is being processed by another instance. Skipping."
         )
+        return None
 
-        if DEBUG:
-            elapsed_time = time.time_ns() / 1e6 - start_time
-            print(f"Duration to load model: {elapsed_time:.2f} ms")
+    try:
+        print(f"\nProcessing: {audio_file_path}")
 
-        start_time = time.time_ns() / 1e6
-        audio = whisperx.load_audio(audio_file_path)
+        # Create output directory for this file
+        relative_path = os.path.relpath(
+            os.path.dirname(audio_file_path), PROCESSING_DIR
+        )
+        base_filename = os.path.basename(os.path.splitext(audio_file_path)[0])
+        output_subdir = os.path.join(OUTPUT_DIR, relative_path, base_filename)
+        os.makedirs(output_subdir, exist_ok=True)
 
-        if DEBUG:
-            elapsed_time = time.time_ns() / 1e6 - start_time
-            print(f"Duration to load audio: {elapsed_time:.2f} ms")
+        # Save JSON path (in same folder as input file)
+        json_output_path = os.path.splitext(audio_file_path)[0] + ".json"
+        with torch.inference_mode():
+            asr_options = {
+                "initial_prompt": INITIAL_PROMPT,
+                "temperatures": TEMPERATURES,
+                "beam_size": BEAM_SIZE,
+                "best_of": BEST_OF,
+            }
 
-        start_time = time.time_ns() / 1e6
-        result = model.transcribe(audio, batch_size=BATCH_SIZE)
-        detected_language = result["language"]
+            vad_options = {"vad_onset": VAD_ONSET, "vad_offset": VAD_OFFSET}
 
-        if DEBUG:
-            elapsed_time = time.time_ns() / 1e6 - start_time
-            print(f"Duration to transcribe: {elapsed_time:.2f} ms")
+            # Perform language detection if needed
+            audio_duration = get_audio_duration(audio_file_path)
 
-        gc.collect()
-        torch.cuda.empty_cache()
-        del model
-
-        # Align if needed
-        if ALIGN_OUTPUT:
             if (
-                detected_language in whisperx.alignment.DEFAULT_ALIGN_MODELS_TORCH
-                or detected_language in whisperx.alignment.DEFAULT_ALIGN_MODELS_HF
+                language is None
+                and LANGUAGE_DETECTION_MIN_PROB > 0
+                and audio_duration > 30000
             ):
-                result = align(audio, result, DEBUG)
-            else:
-                print(
-                    f"Cannot align output as language {detected_language} is not supported for alignment"
+                segments_duration_ms = 30000
+
+                language_detection_max_tries = min(
+                    LANGUAGE_DETECTION_MAX_TRIES,
+                    math.floor(audio_duration / segments_duration_ms),
                 )
 
-        # Diarize if needed
-        if DIARIZATION:
-            result = diarize(
-                audio,
-                result,
-                DEBUG,
-                HUGGINGFACE_ACCESS_TOKEN,
-                MIN_SPEAKERS,
-                MAX_SPEAKERS,
+                segments_starts = distribute_segments_equally(
+                    audio_duration, segments_duration_ms, language_detection_max_tries
+                )
+
+                print(
+                    "Detecting languages on segments starting at "
+                    + ", ".join(map(str, segments_starts))
+                )
+
+                detected_language_details = detect_language(
+                    audio_file_path,
+                    segments_starts,
+                    LANGUAGE_DETECTION_MIN_PROB,
+                    LANGUAGE_DETECTION_MAX_TRIES,
+                    asr_options,
+                    vad_options,
+                )
+
+                detected_language_code = detected_language_details["language"]
+                detected_language_prob = detected_language_details["probability"]
+                detected_language_iterations = detected_language_details["iterations"]
+
+                print(
+                    f"Detected language {detected_language_code} ({detected_language_prob:.2f}) after "
+                    f"{detected_language_iterations} iterations."
+                )
+
+                language = detected_language_details["language"]
+
+            # Load model and transcribe
+            start_time = time.time_ns() / 1e6
+
+            model = whisperx.load_model(
+                WHISPER_ARCH,
+                DEVICE,
+                compute_type=COMPUTE_TYPE,
+                language=language,
+                asr_options=asr_options,
+                vad_options=vad_options,
             )
 
+            if DEBUG:
+                elapsed_time = time.time_ns() / 1e6 - start_time
+                print(f"Duration to load model: {elapsed_time:.2f} ms")
+
+            start_time = time.time_ns() / 1e6
+            audio = whisperx.load_audio(audio_file_path)
+
+            if DEBUG:
+                elapsed_time = time.time_ns() / 1e6 - start_time
+                print(f"Duration to load audio: {elapsed_time:.2f} ms")
+
+            start_time = time.time_ns() / 1e6
+            result = model.transcribe(audio, batch_size=BATCH_SIZE)
+            detected_language = result["language"]
+
+            if DEBUG:
+                elapsed_time = time.time_ns() / 1e6 - start_time
+                print(f"Duration to transcribe: {elapsed_time:.2f} ms")
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            del model
+
+            # Align if needed
+            if ALIGN_OUTPUT:
+                if (
+                    detected_language in whisperx.alignment.DEFAULT_ALIGN_MODELS_TORCH
+                    or detected_language in whisperx.alignment.DEFAULT_ALIGN_MODELS_HF
+                ):
+                    result = align(audio, result, DEBUG)
+                else:
+                    print(
+                        f"Cannot align output as language {detected_language} is not supported for alignment"
+                    )
+
+            # Diarize if needed
+            if DIARIZATION:
+                result = diarize(
+                    audio,
+                    result,
+                    DEBUG,
+                    HUGGINGFACE_ACCESS_TOKEN,
+                    MIN_SPEAKERS,
+                    MAX_SPEAKERS,
+                )
         result["filename"] = audio_file_path
         result["base_filename"] = os.path.basename(audio_file_path)
-
+        result["instance_id"] = INSTANCE_ID
         # Process speaker segments
         if "segments" in result:
-            # Add concatenated samples to the result JSON
             result["concatenated_speaker_samples"] = concat_speaker_samples(
                 result["segments"]
             )
-
-            # Extract and save audio segments
             extract_and_save_segments(
                 audio_file_path, result["concatenated_speaker_samples"], output_subdir
             )
@@ -594,10 +677,15 @@ def process_file(audio_file_path, language=None):
             )
 
         return result
+    finally:
+        # Always release the lock, even if an exception occurs
+        release_lock(lock_file, lock_path)
 
 
 def main():
     """Main function to run the audio processing pipeline."""
+    print(f"Starting processing with Instance ID: {INSTANCE_ID} on GPU: {args.gpu}")
+
     # Get unprocessed files
     unprocessed_files = search_unprocessed_files()
     print(f"Found {len(unprocessed_files)} unprocessed audio files.")
@@ -622,3 +710,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# Run with: CUDA_VISIBLE_DEVICES=0 HF_HOME="/media/bodza/Audio_Dataset/hf_cache/" LD_LIBRARY_PATH="/home/bodza/Amphion/preprocessors/Emilia/.venv/lib/python3.9/site-packages/nvidia/cudnn/lib;/home/bodza/miniconda3/envs/parlertts/lib/python3.10/site-packages/nvidia/cudnn/lib/" python process_files.py --gpu 0 --instance-id 0 --sample-size 10
+
+# CUDA_VISIBLE_DEVICES=1 HF_HOME="/media/bodza/Audio_Dataset/hf_cache/" LD_LIBRARY_PATH="/home/bodza/Amphion/preprocessors/Emilia/.venv/lib/python3.9/site-packages/nvidia/cudnn/lib;/home/bodza/miniconda3/envs/parlertts/lib/python3.10/site-packages/nvidia/cudnn/lib/" python process_files.py --gpu 1 --instance-id 1 --sample-size 10
